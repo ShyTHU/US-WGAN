@@ -1,0 +1,324 @@
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+class Generator(keras.Model):
+
+    def __init__(self):
+        super(Generator, self).__init__()
+
+        # z: [b, 100] => [b, 8000]
+        self.fc1 = layers.Dense(1024)
+        self.fc2 = layers.Dense(8000)
+
+    def call(self, inputs, training=None):
+        # [z, 100] => [z, 8000]
+        x = self.fc1(inputs)
+        x = tf.nn.leaky_relu(x)
+        x = self.fc2(x)
+        x = tf.sigmoid(x)
+
+        return x
+
+
+class Discriminator(keras.Model):
+
+    def __init__(self):
+        super(Discriminator, self).__init__()
+
+        # [b, 8000] => [b, 1]
+        self.fc1 = layers.Dense(1024)
+        self.fc2 = layers.Dense(1)
+
+
+    def call(self, inputs, training=None):
+
+        # [b, 8000] => [b, 1]
+        x = self.fc1(inputs)
+        x = tf.nn.leaky_relu(x)
+        logits = self.fc2(x)
+
+        return logits
+
+def get_data(file_path, shuffle_number=1000, batch_number=100):
+    data_read = pd.read_csv(file_path, header=None) # Prevent the first line from being a header
+    data = data_read.values[:, 10:] # Each row is read as data starting from the 11th
+    label = []
+    for i in data_read.values[:, 1:2]: # The second in each line is read as a label
+        for j in i:
+            label.append(j)
+    label = np.array(label) # List into matrix
+    data_db  = tf.data.Dataset.from_tensor_slices(tf.constant(data, dtype=tf.float32))
+    label_db = tf.data.Dataset.from_tensor_slices(tf.constant(label, dtype=tf.int32))
+    data_base = tf.data.Dataset.zip((data_db, label_db)).shuffle(shuffle_number).batch(batch_number, drop_remainder=True)
+    return data_base
+
+def celoss_ones(logits):
+    # [b, 1]
+    # [b] = [1, 1, 1, 1,]
+    loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=logits,
+                                                   labels=tf.ones_like(logits))
+    return tf.reduce_mean(loss)
+
+def celoss_zeros(logits):
+    # [b, 1]
+    # [b] = [1, 1, 1, 1,]
+    loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=logits,
+                                                   labels=tf.zeros_like(logits))
+    return tf.reduce_mean(loss)
+
+def d_loss_fn(generator, discriminator, batch_z, batch_x, is_training):
+    # 1. treat real signal as real
+    # 2. treat generated signal as fake
+    fake_signal = generator(batch_z, is_training)
+    d_fake_logits = discriminator(fake_signal, is_training)
+    d_real_logits = discriminator(batch_x, is_training)
+
+    d_loss_real = celoss_ones(d_real_logits)
+    d_loss_fake = celoss_zeros(d_fake_logits)
+    gp = gradient_penalty(discriminator, batch_x, fake_signal)
+
+    loss = d_loss_fake + d_loss_real + 1. * gp
+
+    return loss, gp
+
+def g_loss_fn(generator, discriminator, batch_z, is_training):
+
+    fake_signal = generator(batch_z, is_training)
+    d_fake_logits = discriminator(fake_signal, is_training)
+    loss = celoss_ones(d_fake_logits)
+
+    return loss
+
+def gradient_penalty(discriminator, batch_x, fake_signal):
+
+    batchsz = batch_x.shape[0]
+
+    # [b, 1]
+    t = tf.random.uniform([batchsz, 1])
+
+
+    interplate = t * batch_x + (1 - t) * fake_signal
+
+    with tf.GradientTape() as tape:
+        tape.watch([interplate])
+        d_interplote_logits = discriminator(interplate)
+    grads = tape.gradient(d_interplote_logits, interplate)
+
+    # grads:[b, 1] => [b, -1]
+    grads = tf.reshape(grads, [grads.shape[0], -1])
+    gp = tf.norm(grads, axis=1) #[b]
+    gp = tf.reduce_mean( (gp-1)**2 )
+
+    return gp
+
+def main():
+
+    tf.random.set_seed(22)
+    np.random.seed(22)
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    assert tf.__version__.startswith('2.')
+
+
+    # hyper parameters
+    z_dim = 100
+    epochs = 3100
+    batch_size = 512
+    learning_rate = 0.001
+    is_training = True
+
+    dataset = get_data(file_path=r'C:\Users\孙洪宇\PycharmProjects\MyProject\UltraDL\Data\CSV_corrosion\train_corrosion.csv', batch_number=batch_size)
+
+    generator = Generator()
+    generator.build(input_shape = (None, z_dim))
+    discriminator = Discriminator()
+    discriminator.build(input_shape=(None, 8000))
+
+    g_optimizer = tf.optimizers.Adam(learning_rate=learning_rate, beta_1=0.5)
+    d_optimizer = tf.optimizers.Adam(learning_rate=learning_rate, beta_1=0.5)
+
+
+    for epoch in range(epochs):
+
+        for step, (x, y) in enumerate(dataset):
+
+
+            batch_z = tf.random.uniform([batch_size, z_dim], minval=0., maxval=1.)
+            batch_x = x
+
+            # train D
+            with tf.GradientTape() as tape:
+                d_loss, gp = d_loss_fn(generator, discriminator, batch_z, batch_x, is_training)
+            grads = tape.gradient(d_loss, discriminator.trainable_variables)
+            d_optimizer.apply_gradients(zip(grads, discriminator.trainable_variables))
+
+
+            with tf.GradientTape() as tape:
+                g_loss = g_loss_fn(generator, discriminator, batch_z, is_training)
+            grads = tape.gradient(g_loss, generator.trainable_variables)
+            g_optimizer.apply_gradients(zip(grads, generator.trainable_variables))
+
+        if epoch % 100 == 0:
+            print(epoch, 'd-loss:',float(d_loss), 'g-loss:', float(g_loss),
+                  'gp:', float(gp))
+
+            z = tf.random.uniform([100, z_dim])
+            fake_signal = generator(z, training=False)
+
+            plt.subplot(3, 3, 1)
+            plt.plot(range(8000), fake_signal[0])
+            plt.subplot(3, 3, 2)
+            plt.plot(range(8000), fake_signal[1])
+            plt.subplot(3, 3, 3)
+            plt.plot(range(8000), fake_signal[2])
+            plt.subplot(3, 3, 4)
+            plt.plot(range(8000), fake_signal[3])
+            plt.subplot(3, 3, 5)
+            plt.plot(range(8000), fake_signal[4])
+            plt.subplot(3, 3, 6)
+            plt.plot(range(8000), fake_signal[5])
+            plt.subplot(3, 3, 7)
+            plt.plot(range(8000), fake_signal[6])
+            plt.subplot(3, 3, 8)
+            plt.plot(range(8000), fake_signal[7])
+            plt.subplot(3, 3, 9)
+            plt.plot(range(8000), fake_signal[8])
+
+            plt.show()
+
+            if epoch == 100:
+                data_read = pd.DataFrame(fake_signal[8])
+                data_read.to_csv(r'C:\Users\孙洪宇\Desktop\s100.csv', header=False, index=False, float_format='%.3f')
+
+                # 0
+                # d - loss: 1.3132237195968628
+                # g - loss: 92.89482879638672
+                # gp: 0.11687743663787842
+                # 100
+                # d - loss: 0.8453620672225952
+                # g - loss: 1.7043490409851074
+                # gp: 0.07117190957069397
+                # 200
+                # d - loss: 1.0583966970443726
+                # g - loss: 1.2766847610473633
+                # gp: 0.01160381082445383
+                # 300
+                # d - loss: 1.377980351448059
+                # g - loss: 0.8271889090538025
+                # gp: 0.0012982640182599425
+                # 400
+                # d - loss: 1.3049871921539307
+                # g - loss: 0.9179456830024719
+                # gp: 0.0022174431942403316
+                # 500
+                # d - loss: 1.352523922920227
+                # g - loss: 0.7911360263824463
+                # gp: 0.000989817432127893
+                # 600
+                # d - loss: 1.3553881645202637
+                # g - loss: 0.7496078014373779
+                # gp: 0.007661459036171436
+                # 700
+                # d - loss: 1.3362032175064087
+                # g - loss: 0.7642130851745605
+                # gp: 0.002451681299135089
+                # 800
+                # d - loss: 1.4063102006912231
+                # g - loss: 0.7750335931777954
+                # gp: 0.002365944441407919
+                # 900
+                # d - loss: 1.4504376649856567
+                # g - loss: 0.7153424024581909
+                # gp: 0.0015021038707345724
+                # 1000
+                # d - loss: 1.3647667169570923
+                # g - loss: 0.7217354774475098
+                # gp: 0.0011136675020679832
+                # 1100
+                # d - loss: 1.3564990758895874
+                # g - loss: 0.7359963059425354
+                # gp: 0.004952601157128811
+                # 1200
+                # d - loss: 1.3415273427963257
+                # g - loss: 0.7368282079696655
+                # gp: 0.0034014086704701185
+                # 1300
+                # d - loss: 1.1900701522827148
+                # g - loss: 0.887763500213623
+                # gp: 0.008046919479966164
+                # 1400
+                # d - loss: 1.3108792304992676
+                # g - loss: 0.8081141114234924
+                # gp: 0.003754619974642992
+                # 1500
+                # d - loss: 1.2911458015441895
+                # g - loss: 0.7619667053222656
+                # gp: 0.006107255816459656
+                # 1600
+                # d - loss: 1.2831974029541016
+                # g - loss: 0.774861216545105
+                # gp: 0.005055654793977737
+                # 1700
+                # d - loss: 1.3955501317977905
+                # g - loss: 0.750004768371582
+                # gp: 0.004964801482856274
+                # 1800
+                # d - loss: 1.3049256801605225
+                # g - loss: 0.7638030648231506
+                # gp: 0.0022560306824743748
+                # 1900
+                # d - loss: 1.287636160850525
+                # g - loss: 0.7794212102890015
+                # gp: 0.004543307237327099
+                # 2000
+                # d - loss: 1.281834602355957
+                # g - loss: 0.7734619975090027
+                # gp: 0.008637472987174988
+                # 2100
+                # d - loss: 1.2284477949142456
+                # g - loss: 0.8304874897003174
+                # gp: 0.01026432029902935
+                # 2200
+                # d - loss: 1.288710594177246
+                # g - loss: 0.8025250434875488
+                # gp: 0.007358069997280836
+                # 2300
+                # d - loss: 1.1936395168304443
+                # g - loss: 0.82588130235672
+                # gp: 0.011915081180632114
+                # 2400
+                # d - loss: 1.1434574127197266
+                # g - loss: 0.8449186086654663
+                # gp: 0.010236280970275402
+                # 2500
+                # d - loss: 1.1166326999664307
+                # g - loss: 0.8944125771522522
+                # gp: 0.012492720037698746
+                # 2600
+                # d - loss: 1.1034725904464722
+                # g - loss: 0.8760174512863159
+                # gp: 0.015396089293062687
+                # 2700
+                # d - loss: 1.0772178173065186
+                # g - loss: 0.8862932920455933
+                # gp: 0.015403618104755878
+                # 2800
+                # d - loss: 1.088278889656067
+                # g - loss: 0.9055101871490479
+                # gp: 0.018739666789770126
+                # 2900
+                # d - loss: 1.0721319913864136
+                # g - loss: 0.9199122190475464
+                # gp: 0.016477463766932487
+                # 3000
+                # d - loss: 1.08851158618927
+                # g - loss: 0.8957300186157227
+                # gp: 0.015207342803478241
+
+
+if __name__ == '__main__':
+    main()
